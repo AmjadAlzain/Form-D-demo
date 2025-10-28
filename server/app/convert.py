@@ -148,7 +148,43 @@ def _load_hs_mapping() -> dict[str, str]:
 
 
 HS_CODE_TO_UNIT = _load_hs_mapping()
-_LOGGED_MISSING_CODES: set[tuple[str, str]] = set()
+_LOGGED_MISSING_CODES: set[tuple[str, tuple[str, ...]]] = set()
+
+
+def _build_candidate_keys(hs_digits: str, hs_out: str) -> list[str]:
+    candidates = [
+        hs_out,
+        hs_out[:8],
+        hs_digits,
+        hs_digits.rstrip("0"),
+        hs_digits[:6],
+    ]
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for candidate in candidates:
+        candidate = (candidate or "").strip()
+        if not candidate:
+            continue
+        if candidate not in seen:
+            seen.add(candidate)
+            ordered.append(candidate)
+    return ordered
+
+
+def _resolve_unit(raw_hs: object, hs_digits: str, hs_out: str) -> tuple[str, str | None, list[str]]:
+    candidates = _build_candidate_keys(hs_digits, hs_out)
+    for idx, candidate in enumerate(candidates):
+        unit = HS_CODE_TO_UNIT.get(candidate)
+        if unit:
+            if idx > 0:
+                logging.debug(
+                    "HS unit matched on fallback key: %s (raw=%r candidates=%s)",
+                    candidate,
+                    raw_hs,
+                    candidates,
+                )
+            return unit, candidate, candidates
+    return "N/A", None, candidates
 
 
 def normalize_for_match(value: object) -> str:
@@ -193,7 +229,16 @@ def convert_to_k1(
     output = pd.DataFrame(index=source_df.index)
 
     hs_series = _get_series(source_df, HS_CANDIDATES, default="").fillna("")
+    hs_digits_series = hs_series.apply(_digits_only)
     hs_clean = hs_series.apply(_hs_out_code)
+
+    units: list[str] = []
+    candidate_lists: list[list[str]] = []
+    for raw_hs, hs_digits, hs_out in zip(hs_series, hs_digits_series, hs_clean):
+        unit, _, candidates = _resolve_unit(raw_hs, hs_digits, hs_out)
+        units.append(unit)
+        candidate_lists.append(candidates)
+    unit_series = pd.Series(units, index=source_df.index, dtype="object")
 
     quantity_series = pd.to_numeric(
         _get_series(source_df, QUANTITY_CANDIDATES, default=0), errors="coerce"
@@ -211,7 +256,6 @@ def convert_to_k1(
     ).fillna("")
     parts_name_series = parts_name_series.astype(str)
 
-    unit_series = hs_clean.map(lambda code: HS_CODE_TO_UNIT.get(code, "N/A")).astype("object")
     unit_upper = unit_series.str.upper()
 
     statistical_qty = pd.Series([""] * len(source_df), index=source_df.index, dtype="object")
@@ -229,12 +273,19 @@ def convert_to_k1(
         statistical_qty.loc[unt_mask] = qty_values
         declared_qty.loc[unt_mask] = qty_values
 
-    missing_mask = unit_upper == "N/A"
-    if missing_mask.any():
-        for raw_code, out_code in zip(hs_series[missing_mask], hs_clean[missing_mask]):
-            key = (str(raw_code), str(out_code))
+    if (unit_upper == "N/A").any():
+        for position, (idx, value) in enumerate(unit_upper.items()):
+            if value != "N/A":
+                continue
+            raw_code = hs_series.iloc[position]
+            candidates = tuple(candidate_lists[position])
+            key = (str(raw_code), candidates)
             if key not in _LOGGED_MISSING_CODES:
-                logging.warning("HS code not in mapping: raw=%r -> %s", raw_code, out_code)
+                logging.warning(
+                    "HS code not in mapping: raw=%r candidates=%s",
+                    raw_code,
+                    list(candidates),
+                )
                 _LOGGED_MISSING_CODES.add(key)
 
     country_value = (country or "ID").strip().upper() or "ID"
@@ -485,7 +536,3 @@ def _df_from_xls_bytes(xls_bytes: bytes) -> pd.DataFrame:
     if rows:
         return pd.DataFrame(rows, columns=headers)
     return pd.DataFrame(columns=headers)
-
-
-def _lookup_hs_unit(value: object) -> str:
-    return HS_CODE_TO_UNIT.get(_digits_only(value), "N/A")
