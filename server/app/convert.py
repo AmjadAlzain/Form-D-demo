@@ -9,7 +9,6 @@ import re
 from pathlib import Path
 from typing import Iterable, List
 
-import numpy as np
 import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
@@ -20,7 +19,6 @@ if not TEMPLATE_PATH.exists():
     if alt_template.exists():
         TEMPLATE_PATH = alt_template
 
-RANDOM_SEED = 42
 ALWAYS_BLANK_COLUMN_NAMES = [
     "ExciseDutyMethod",
     "ExciseDutyRateExemptedPercentage",
@@ -33,7 +31,7 @@ ALWAYS_BLANK_COLUMN_NAMES = [
     "CC",
     "Year",
 ]
-HS_CANDIDATES = ["Hs Code", "HS Code", "HSCode", "HS-Code"]
+HS_CANDIDATES = ["Hs Code", "HS Code", "Hscode", "HSCode", "HS-Code"]
 NET_WEIGHT_CANDIDATES = [
     "Net Weight(Kg)",
     "Net Weight (Kg)",
@@ -45,16 +43,87 @@ AMOUNT_CANDIDATES = ["Amount(USD)", "Amount (USD)", "Amount USD", "Amount"]
 PARTS_CANDIDATES = ["Parts Name", "Description", "Item Description"]
 QUANTITY_CANDIDATES = ["Quantity", "Qty", "QTY"]
 FORM_FLAG_CANDIDATES = ["Form Flag", "FormFlag", "Form_Flag", "Form flag"]
+HS_MAPPING_PATH = Path(__file__).resolve().parent.parent / "templates" / "HSCODE.xlsx"
 
 
-def normalize_header(value: object) -> str:
-    if value is None:
-        return ""
-    return str(value).lstrip("'").strip()
+def _normalize_header(value: object) -> str:
+    return re.sub(r"[\s_\-]+", "", str(value or "").strip().lower())
+
+
+def _digits_only(value: object) -> str:
+    return re.sub(r"\D", "", str(value or ""))
+
+
+def _hs_out_code(value: object) -> str:
+    digits = _digits_only(value)
+    return f"{digits}00"
+
+
+def _coerce_mapping_frame(df: pd.DataFrame) -> pd.DataFrame | None:
+    if df is None or df.empty:
+        return None
+    normalized_cols = {_normalize_header(col): col for col in df.columns}
+    code_col = normalized_cols.get("hscode")
+    unit_col = normalized_cols.get("unit")
+    if not code_col or not unit_col:
+        return None
+    subset = df[[code_col, unit_col]].copy()
+    subset.columns = ["hscode", "unit"]
+    subset["hscode"] = subset["hscode"].fillna("").astype(str).map(_digits_only)
+    subset["unit"] = subset["unit"].fillna("").astype(str).str.strip().str.upper()
+    subset = subset[(subset["hscode"] != "") & (subset["unit"] != "") & (subset["unit"] != "NAN")]
+    return subset
+
+
+def _load_hs_mapping() -> dict[str, str]:
+    if not HS_MAPPING_PATH.exists():
+        logging.warning("HS mapping file not found at %s; defaulting to empty mapping.", HS_MAPPING_PATH)
+        return {}
+
+    mapping_df: pd.DataFrame | None = None
+    try:
+        sheet_df = pd.read_excel(
+            HS_MAPPING_PATH,
+            sheet_name="Sheet2",
+            dtype=str,
+            engine="openpyxl",
+        )
+        mapping_df = _coerce_mapping_frame(sheet_df)
+    except Exception:  # noqa: BLE001
+        mapping_df = None
+
+    if mapping_df is None:
+        try:
+            all_sheets = pd.read_excel(
+                HS_MAPPING_PATH,
+                sheet_name=None,
+                dtype=str,
+                engine="openpyxl",
+            )
+        except Exception as exc:  # noqa: BLE001
+            logging.warning("Failed to load HS mapping workbook: %s", exc)
+            return {}
+        for df in all_sheets.values():
+            mapping_df = _coerce_mapping_frame(df)
+            if mapping_df is not None:
+                break
+
+    if mapping_df is None or mapping_df.empty:
+        logging.warning("HS mapping file missing required Hscode/Unit columns.")
+        return {}
+
+    mapping: dict[str, str] = {}
+    for code, unit in zip(mapping_df["hscode"], mapping_df["unit"]):
+        mapping.setdefault(code, unit)
+    return mapping
+
+
+HS_CODE_TO_UNIT = _load_hs_mapping()
+_LOGGED_MISSING_CODES: set[tuple[str, str]] = set()
 
 
 def normalize_for_match(value: object) -> str:
-    return normalize_header(value).lower()
+    return _normalize_header(value)
 
 
 ALWAYS_BLANK_NORMALIZED = {
@@ -67,14 +136,10 @@ ALWAYS_BLANK_COLLAPSED = {
 
 def convert_to_k1(
     uploaded_bytes: bytes,
-    uom_mode: str = "random",
+    country: str = "ID",
     template_path: str | Path | None = None,
 ) -> bytes:
     """Convert uploaded spreadsheet bytes into K1 import XLSX bytes."""
-    if uom_mode not in {"random", "kgm"}:
-        raise ValueError("uom_mode must be 'random' or 'kgm'.")
-
-    np.random.seed(RANDOM_SEED)
     source_df = _load_source_dataframe(uploaded_bytes)
     source_df = _normalize_columns(source_df)
 
@@ -98,8 +163,8 @@ def convert_to_k1(
 
     output = pd.DataFrame(index=source_df.index)
 
-    hs_series = _get_series(source_df, HS_CANDIDATES, default="")
-    hs_clean = hs_series.apply(_sanitize_hs)
+    hs_series = _get_series(source_df, HS_CANDIDATES, default="").fillna("")
+    hs_clean = hs_series.apply(_hs_out_code)
 
     quantity_series = pd.to_numeric(
         _get_series(source_df, QUANTITY_CANDIDATES, default=0), errors="coerce"
@@ -117,20 +182,38 @@ def convert_to_k1(
     ).fillna("")
     parts_name_series = parts_name_series.astype(str)
 
-    if uom_mode == "random":
-        uom_values = np.random.choice(["KGM", "UNT"], size=len(source_df))
-    else:
-        uom_values = np.full(len(source_df), "KGM")
-    uom_val = pd.Series(uom_values, index=source_df.index, dtype="object")
+    unit_series = hs_clean.map(lambda code: HS_CODE_TO_UNIT.get(code, "N/A")).astype("object")
+    unit_upper = unit_series.str.upper()
 
-    statistical_qty = net_weight_series.copy().astype(float)
-    statistical_qty[uom_val == "UNT"] = quantity_series[uom_val == "UNT"]
-    declared_qty = statistical_qty.copy()
+    statistical_qty = pd.Series([""] * len(source_df), index=source_df.index, dtype="object")
+    declared_qty = pd.Series([""] * len(source_df), index=source_df.index, dtype="object")
 
-    output["Country of Origin"] = "ID"
+    kgm_mask = unit_upper == "KGM"
+    if kgm_mask.any():
+        net_values = net_weight_series.loc[kgm_mask].astype(float)
+        statistical_qty.loc[kgm_mask] = net_values
+        declared_qty.loc[kgm_mask] = net_values
+
+    unt_mask = unit_upper == "UNT"
+    if unt_mask.any():
+        qty_values = quantity_series.loc[unt_mask].astype(float)
+        statistical_qty.loc[unt_mask] = qty_values
+        declared_qty.loc[unt_mask] = qty_values
+
+    missing_mask = unit_upper == "N/A"
+    if missing_mask.any():
+        for raw_code, out_code in zip(hs_series[missing_mask], hs_clean[missing_mask]):
+            key = (str(raw_code), str(out_code))
+            if key not in _LOGGED_MISSING_CODES:
+                logging.warning("HS code not in mapping: raw=%r -> %s", raw_code, out_code)
+                _LOGGED_MISSING_CODES.add(key)
+
+    country_value = (country or "ID").strip().upper() or "ID"
+
+    output["CountryOfOrigin"] = country_value
     output["HSCode"] = hs_clean
-    output["StatisticalUOM"] = uom_val
-    output["DeclaredUOM"] = uom_val
+    output["StatisticalUOM"] = unit_series
+    output["DeclaredUOM"] = unit_series
     output["StatisticalQty"] = statistical_qty
     output["DeclaredQty"] = declared_qty
     output["ItemAmount"] = amount_series
@@ -177,7 +260,7 @@ def convert_to_k1(
     method_occurrence = 0
     final_series: list[pd.Series] = []
     for template_column in template_columns:
-        normalized_template_column = normalize_header(template_column)
+        normalized_template_column = _normalize_header(template_column)
         normalized_template_key = normalize_for_match(template_column)
         collapsed_template_key = re.sub(r"[^a-z0-9]", "", normalized_template_key)
 
@@ -324,11 +407,7 @@ def _normalize_flag(value: object) -> str:
 
 
 def _sanitize_hs(value: object) -> str:
-    if pd.isna(value):
-        return ""
-    digits_only = "".join(ch for ch in str(value) if ch.isdigit())
-    # TODO: Clamp to required length if business rules change; current spec always appends "00".
-    return f"{digits_only}00"
+    return _hs_out_code(value)
 
 
 def _maybe_log_debug_samples(df: pd.DataFrame) -> None:
@@ -385,3 +464,7 @@ def _df_from_xls_bytes(xls_bytes: bytes) -> pd.DataFrame:
     if rows:
         return pd.DataFrame(rows, columns=headers)
     return pd.DataFrame(columns=headers)
+
+
+def _lookup_hs_unit(value: object) -> str:
+    return HS_CODE_TO_UNIT.get(_digits_only(value), "N/A")

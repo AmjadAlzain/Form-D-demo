@@ -7,7 +7,7 @@ const convertButton = document.getElementById("convert-button");
 const statusEl = document.getElementById("status");
 const lastFileSection = document.getElementById("last-file");
 const lastFileLink = document.getElementById("last-file-link");
-const uomSelect = document.getElementById("uom-select");
+const countrySelect = document.getElementById("country-select");
 
 let selectedFile = null;
 let lastDownloadUrl = null;
@@ -185,7 +185,7 @@ convertForm.addEventListener("submit", async (event) => {
 
   const formData = new FormData();
   formData.append("file", selectedFile);
-  const uomMode = uomSelect.value || "random";
+  const country = countrySelect.value || "ID";
 
   convertButton.disabled = true;
   convertButton.textContent = "Converting...";
@@ -193,8 +193,8 @@ convertForm.addEventListener("submit", async (event) => {
   showSpinner();
 
   try {
-    const response = await fetch(`/api/convert?uom_mode=${encodeURIComponent(
-      uomMode
+    const response = await fetch(`/api/convert?country=${encodeURIComponent(
+      country
     )}`, {
       method: "POST",
       body: formData,

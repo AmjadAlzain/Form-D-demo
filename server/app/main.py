@@ -33,20 +33,18 @@ async def health() -> dict[str, str]:
 @app.post("/api/convert")
 async def convert(
     file: UploadFile = File(...),
-    uom_mode: str = Query("random"),
+    country: str = Query("ID"),
 ) -> StreamingResponse:
     """Convert uploaded spreadsheet into K1 import XLSX."""
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-    uom_mode = (uom_mode or "random").lower()
-    if uom_mode not in ("kgm", "random"):
-        raise HTTPException(
-            status_code=400, detail="uom_mode must be 'kgm' or 'random'"
-        )
+    country = (country or "ID").strip()
+    if not country:
+        raise HTTPException(status_code=400, detail="country must be provided.")
 
     try:
-        converted_bytes = convert_to_k1(data, uom_mode=uom_mode)
+        converted_bytes = convert_to_k1(data, country=country)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     except ValueError as exc:

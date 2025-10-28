@@ -5,9 +5,10 @@ import zipfile
 from pathlib import Path
 from typing import List
 
-import numpy as np
 import pandas as pd
+from unittest.mock import patch
 
+from server.app import convert as convert_module
 from server.app.convert import convert_to_k1
 
 NAMESPACE = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
@@ -108,9 +109,16 @@ class ConvertToK1Tests(unittest.TestCase):
             buffer = io.BytesIO()
             source_df.to_excel(buffer, index=False)
 
-            result_bytes = convert_to_k1(
-                buffer.getvalue(), uom_mode="kgm", template_path=str(template_path)
-            )
+            with patch.dict(
+                convert_module.HS_CODE_TO_UNIT,
+                {"123400": "UNT"},
+                clear=True,
+            ):
+                result_bytes = convert_to_k1(
+                    buffer.getvalue(),
+                    country="MY",
+                    template_path=str(template_path),
+                )
 
             rows = _extract_rows(result_bytes, len(template_columns))
             headers = rows[0]
@@ -130,13 +138,16 @@ class ConvertToK1Tests(unittest.TestCase):
 
             uom_value = values[headers.index("StatisticalUOM")]
             declared_uom_value = values[headers.index("DeclaredUOM")]
-            self.assertEqual(uom_value, "KGM")
+            self.assertEqual(uom_value, "UNT")
             self.assertEqual(declared_uom_value, uom_value)
 
             stat_qty_value = float(values[headers.index("StatisticalQty")])
             decl_qty_value = float(values[headers.index("DeclaredQty")])
-            self.assertEqual(stat_qty_value, 5.5)
-            self.assertEqual(decl_qty_value, 5.5)
+            self.assertEqual(stat_qty_value, 10.0)
+            self.assertEqual(decl_qty_value, 10.0)
+
+            origin_value = values[headers.index("Country of Origin")]
+            self.assertEqual(origin_value, "MY")
 
             for column_name in [
                 "ExciseDutyMethod",
@@ -154,7 +165,7 @@ class ConvertToK1Tests(unittest.TestCase):
                 column_index = headers.index(column_name)
                 self.assertIn(values[column_index], ("", None))
 
-    def test_random_uom_behavior(self) -> None:
+    def test_unit_mapping_drives_quantities(self) -> None:
         template_columns = [
             "Country of Origin",
             "HSCode",
@@ -192,9 +203,16 @@ class ConvertToK1Tests(unittest.TestCase):
             buffer = io.BytesIO()
             source_df.to_excel(buffer, index=False)
 
-            result_bytes = convert_to_k1(
-                buffer.getvalue(), uom_mode="random", template_path=str(template_path)
-            )
+            with patch.dict(
+                convert_module.HS_CODE_TO_UNIT,
+                {"123400": "UNT", "234500": "KGM", "345600": "UNT"},
+                clear=True,
+            ):
+                result_bytes = convert_to_k1(
+                    buffer.getvalue(),
+                    country="SG",
+                    template_path=str(template_path),
+                )
 
             rows = _extract_rows(result_bytes, len(template_columns))
             headers = rows[0]
@@ -205,25 +223,31 @@ class ConvertToK1Tests(unittest.TestCase):
             declared_uom_index = headers.index("DeclaredUOM")
             stat_qty_index = headers.index("StatisticalQty")
             declared_index = headers.index("DeclaredQty")
-
-            np.random.seed(42)
-            expected_uom = np.random.choice(["KGM", "UNT"], size=len(source_df))
+            country_index = headers.index("Country of Origin")
+            hs_index = headers.index("HSCode")
 
             for idx, row in enumerate(data_rows):
                 uom_value = row[uom_index]
                 declared_uom_value = row[declared_uom_index]
-                self.assertEqual(uom_value, expected_uom[idx])
                 self.assertEqual(declared_uom_value, uom_value)
+                self.assertEqual(row[country_index], "SG")
+                self.assertTrue(str(row[hs_index]).endswith("00"))
 
-                stat_qty_value = float(row[stat_qty_index])
-                declared_qty_value = float(row[declared_index])
                 if uom_value == "UNT":
+                    stat_qty_value = float(row[stat_qty_index])
+                    declared_qty_value = float(row[declared_index])
                     self.assertEqual(stat_qty_value, float(source_df.loc[idx, "Quantity"]))
                     self.assertEqual(declared_qty_value, float(source_df.loc[idx, "Quantity"]))
-                else:
+                elif uom_value == "KGM":
+                    stat_qty_value = float(row[stat_qty_index])
+                    declared_qty_value = float(row[declared_index])
                     self.assertEqual(
                         stat_qty_value, float(source_df.loc[idx, "Net Weight(Kg)"])
                     )
                     self.assertEqual(
                         declared_qty_value, float(source_df.loc[idx, "Net Weight(Kg)"])
                     )
+                else:
+                    self.assertEqual(uom_value, "N/A")
+                    self.assertIn(row[stat_qty_index], ("", None))
+                    self.assertIn(row[declared_index], ("", None))
