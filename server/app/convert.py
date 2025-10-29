@@ -41,7 +41,7 @@ HS_MAPPING_HEADER_VARIANTS = [
     "Hs code",
     "HS code",
 ]
-UNIT_HEADER_VARIANTS = ["Unit", "Units", "UOM"]
+UNIT_HEADER_VARIANTS = ["Unit", "Units", "UOM", "UNTnit"]
 NET_WEIGHT_CANDIDATES = [
     "Net Weight(Kg)",
     "Net Weight (Kg)",
