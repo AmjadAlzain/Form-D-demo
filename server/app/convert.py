@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import io
+from io import BytesIO
 import logging
 import os
 import re
@@ -11,7 +11,6 @@ from typing import Iterable, List
 
 import pandas as pd
 from openpyxl import load_workbook
-from openpyxl.utils import get_column_letter
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "K1 Import Template.xls"
 if not TEMPLATE_PATH.exists():
@@ -32,6 +31,17 @@ ALWAYS_BLANK_COLUMN_NAMES = [
     "Year",
 ]
 HS_CANDIDATES = ["Hs Code", "HS Code", "Hscode", "HSCode", "HS-Code"]
+HS_MAPPING_HEADER_VARIANTS = [
+    "Hs Code",
+    "HS Code",
+    "Hscode",
+    "HSCode",
+    "HsCode",
+    "H S Code",
+    "Hs code",
+    "HS code",
+]
+UNIT_HEADER_VARIANTS = ["Unit", "Units", "UOM"]
 NET_WEIGHT_CANDIDATES = [
     "Net Weight(Kg)",
     "Net Weight (Kg)",
@@ -44,6 +54,7 @@ PARTS_CANDIDATES = ["Parts Name", "Description", "Item Description"]
 QUANTITY_CANDIDATES = ["Quantity", "Qty", "QTY"]
 FORM_FLAG_CANDIDATES = ["Form Flag", "FormFlag", "Form_Flag", "Form flag"]
 HS_MAPPING_PATH = Path(__file__).resolve().parent.parent / "templates" / "HSCODE.xlsx"
+_CTRL_BAD = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F]")
 
 
 def _normalize_header(value: object) -> str:
@@ -59,12 +70,23 @@ def _hs_out_code(value: object) -> str:
     return f"{digits}00"
 
 
+def _sanitize_cell(value: object) -> object:
+    if value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value)
+    cleaned = _CTRL_BAD.sub(" ", text)
+    if len(cleaned) > 32767:
+        cleaned = cleaned[:32767]
+    return cleaned
+
+
 def _load_template_columns_xlsx(path: Path) -> list[str]:
     wb = load_workbook(path, read_only=True, data_only=True)
     ws = wb.active
     headers: list[str] = []
-    row_iter = ws.iter_rows(min_row=1, max_row=1)
-    first_row = next(row_iter, ())
+    first_row = next(ws.iter_rows(min_row=1, max_row=1), ())
     for cell in first_row:
         value = cell.value
         if isinstance(value, str):
@@ -88,103 +110,69 @@ def _load_template_columns_xls(path: Path) -> list[str]:
     return headers
 
 
-def _coerce_mapping_frame(df: pd.DataFrame) -> pd.DataFrame | None:
+def _locate_mapping_columns(df: pd.DataFrame) -> tuple[str | None, str | None]:
     if df is None or df.empty:
-        return None
+        return None, None
     normalized_cols = {_normalize_header(col): col for col in df.columns}
-    code_col = normalized_cols.get("hscode")
-    unit_col = normalized_cols.get("unit")
-    if not code_col or not unit_col:
-        return None
-    subset = df[[code_col, unit_col]].copy()
-    subset.columns = ["hscode", "unit"]
-    subset["hscode"] = subset["hscode"].fillna("").astype(str).map(_digits_only)
-    subset["unit"] = subset["unit"].fillna("").astype(str).str.strip().str.upper()
-    subset = subset[(subset["hscode"] != "") & (subset["unit"] != "") & (subset["unit"] != "NAN")]
-    return subset
+    code_col = None
+    for variant in HS_MAPPING_HEADER_VARIANTS:
+        key = _normalize_header(variant)
+        if key in normalized_cols:
+            code_col = normalized_cols[key]
+            break
+    unit_col = None
+    for variant in UNIT_HEADER_VARIANTS:
+        key = _normalize_header(variant)
+        if key in normalized_cols:
+            unit_col = normalized_cols[key]
+            break
+    return code_col, unit_col
 
 
 def _load_hs_mapping() -> dict[str, str]:
     if not HS_MAPPING_PATH.exists():
-        logging.warning("HS mapping file not found at %s; defaulting to empty mapping.", HS_MAPPING_PATH)
-        return {}
-
-    mapping_df: pd.DataFrame | None = None
+        raise RuntimeError(f"HSCODE.xlsx not found at {HS_MAPPING_PATH}")
     try:
-        sheet_df = pd.read_excel(
+        sheets = pd.read_excel(
             HS_MAPPING_PATH,
-            sheet_name="Sheet2",
+            sheet_name=None,
             dtype=str,
             engine="openpyxl",
         )
-        mapping_df = _coerce_mapping_frame(sheet_df)
-    except Exception:  # noqa: BLE001
-        mapping_df = None
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"HSCODE.xlsx: failed to load workbook: {exc}") from exc
 
-    if mapping_df is None:
-        try:
-            all_sheets = pd.read_excel(
-                HS_MAPPING_PATH,
-                sheet_name=None,
-                dtype=str,
-                engine="openpyxl",
-            )
-        except Exception as exc:  # noqa: BLE001
-            logging.warning("Failed to load HS mapping workbook: %s", exc)
-            return {}
-        for df in all_sheets.values():
-            mapping_df = _coerce_mapping_frame(df)
-            if mapping_df is not None:
-                break
+    if not sheets:
+        raise RuntimeError("HSCODE.xlsx: workbook has no sheets")
 
-    if mapping_df is None or mapping_df.empty:
-        logging.warning("HS mapping file missing required Hscode/Unit columns.")
-        return {}
+    ordered_sheet_names: list[str] = []
+    if "Sheet2" in sheets:
+        ordered_sheet_names.append("Sheet2")
+    ordered_sheet_names.extend(name for name in sheets if name != "Sheet2")
 
-    mapping: dict[str, str] = {}
-    for code, unit in zip(mapping_df["hscode"], mapping_df["unit"]):
-        mapping.setdefault(code, unit)
-    return mapping
+    for sheet_name in ordered_sheet_names:
+        df = sheets[sheet_name]
+        code_col, unit_col = _locate_mapping_columns(df)
+        if not code_col or not unit_col:
+            continue
+        mapping: dict[str, str] = {}
+        for code_raw, unit_raw in zip(df[code_col], df[unit_col]):
+            code = _digits_only(code_raw)
+            if not code:
+                continue
+            unit_text = str(unit_raw or "").strip()
+            if not unit_text:
+                continue
+            mapping.setdefault(code, unit_text.upper())
+        if mapping:
+            logging.info("Loaded HS mapping from sheet '%s' with %s entries.", sheet_name, len(mapping))
+            return mapping
+    raise RuntimeError("HSCODE.xlsx: could not find a sheet with HS Code and Unit columns")
 
 
 HS_CODE_TO_UNIT = _load_hs_mapping()
-_LOGGED_MISSING_CODES: set[tuple[str, tuple[str, ...]]] = set()
-
-
-def _build_candidate_keys(hs_digits: str, hs_out: str) -> list[str]:
-    candidates = [
-        hs_out,
-        hs_out[:8],
-        hs_digits,
-        hs_digits.rstrip("0"),
-        hs_digits[:6],
-    ]
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for candidate in candidates:
-        candidate = (candidate or "").strip()
-        if not candidate:
-            continue
-        if candidate not in seen:
-            seen.add(candidate)
-            ordered.append(candidate)
-    return ordered
-
-
-def _resolve_unit(raw_hs: object, hs_digits: str, hs_out: str) -> tuple[str, str | None, list[str]]:
-    candidates = _build_candidate_keys(hs_digits, hs_out)
-    for idx, candidate in enumerate(candidates):
-        unit = HS_CODE_TO_UNIT.get(candidate)
-        if unit:
-            if idx > 0:
-                logging.debug(
-                    "HS unit matched on fallback key: %s (raw=%r candidates=%s)",
-                    candidate,
-                    raw_hs,
-                    candidates,
-                )
-            return unit, candidate, candidates
-    return "N/A", None, candidates
+DEBUG_HSLOOKUP = os.getenv("DEBUG_HSLOOKUP") == "1"
+_LOGGED_MISSING_CODES: set[tuple[str, str, tuple[str, ...]]] = set()
 
 
 def normalize_for_match(value: object) -> str:
@@ -229,15 +217,42 @@ def convert_to_k1(
     output = pd.DataFrame(index=source_df.index)
 
     hs_series = _get_series(source_df, HS_CANDIDATES, default="").fillna("")
-    hs_digits_series = hs_series.apply(_digits_only)
     hs_clean = hs_series.apply(_hs_out_code)
 
     units: list[str] = []
-    candidate_lists: list[list[str]] = []
-    for raw_hs, hs_digits, hs_out in zip(hs_series, hs_digits_series, hs_clean):
-        unit, _, candidates = _resolve_unit(raw_hs, hs_digits, hs_out)
+    prefix_lists: list[list[str]] = []
+    for raw_hs, hs_out in zip(hs_series, hs_clean):
+        hs_out_str = str(hs_out or "")
+        max_len = min(len(hs_out_str), 10)
+        prefixes: list[str] = []
+        for length in range(max_len, 4, -1):
+            key = hs_out_str[:length]
+            if not key or (prefixes and key == prefixes[-1]):
+                continue
+            prefixes.append(key)
+        if not prefixes:
+            prefixes.append(hs_out_str)
+        unit = "N/A"
+        matched_key = None
+        for candidate in prefixes:
+            mapping_value = HS_CODE_TO_UNIT.get(candidate)
+            if mapping_value is None:
+                continue
+            normalized_unit = str(mapping_value or "").strip().upper()
+            if normalized_unit in {"", "NA", "NAN", "NULL"}:
+                continue
+            unit = normalized_unit
+            matched_key = candidate
+            break
+        if DEBUG_HSLOOKUP and matched_key and matched_key != hs_out_str:
+            logging.info(
+                "HS matched on prefix: raw='%s' chosen='%s' unit='%s'",
+                raw_hs,
+                matched_key,
+                unit,
+            )
         units.append(unit)
-        candidate_lists.append(candidates)
+        prefix_lists.append(prefixes)
     unit_series = pd.Series(units, index=source_df.index, dtype="object")
 
     quantity_series = pd.to_numeric(
@@ -273,18 +288,20 @@ def convert_to_k1(
         statistical_qty.loc[unt_mask] = qty_values
         declared_qty.loc[unt_mask] = qty_values
 
-    if (unit_upper == "N/A").any():
-        for position, (idx, value) in enumerate(unit_upper.items()):
-            if value != "N/A":
+    if DEBUG_HSLOOKUP and (unit_upper == "N/A").any():
+        for position, (_, value) in enumerate(unit_series.items()):
+            if str(value).upper() != "N/A":
                 continue
             raw_code = hs_series.iloc[position]
-            candidates = tuple(candidate_lists[position])
-            key = (str(raw_code), candidates)
+            hs_out_value = hs_clean.iloc[position]
+            prefixes = tuple(prefix_lists[position])
+            key = (str(raw_code), str(hs_out_value), prefixes)
             if key not in _LOGGED_MISSING_CODES:
                 logging.warning(
-                    "HS code not in mapping: raw=%r candidates=%s",
+                    "HS code not in mapping: raw='%s' -> hs_out='%s' candidates=%s",
                     raw_code,
-                    list(candidates),
+                    hs_out_value,
+                    list(prefixes),
                 )
                 _LOGGED_MISSING_CODES.add(key)
 
@@ -377,25 +394,40 @@ def convert_to_k1(
 
     _maybe_log_debug_samples(final_df)
 
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        final_df.to_excel(writer, index=False, header=True)
+    changed_cells = 0
+
+    def _sanitize_and_count(value: object) -> object:
+        nonlocal changed_cells
+        sanitized = _sanitize_cell(value)
+        if sanitized != value:
+            changed_cells += 1
+        return sanitized
+
     try:
-        _apply_template_styles(buffer, template_file, len(final_df.columns))
-    except Exception as exc:  # noqa: BLE001
-        logging.warning("Failed to copy header styles from template: %s", exc)
-    buffer.seek(0)
+        final_df = final_df.map(_sanitize_and_count)  # pandas >= 2.1
+    except AttributeError:
+        final_df = final_df.apply(lambda col: col.map(_sanitize_and_count))  # older pandas
+    if changed_cells and DEBUG_HSLOOKUP:
+        logging.debug("Sanitized %s cells containing control or overlength text.", changed_cells)
+
+    return _to_clean_xlsx_bytes(final_df)
+
+
+def _to_clean_xlsx_bytes(final_df: pd.DataFrame) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        final_df.to_excel(writer, sheet_name="Sheet1", index=False)
     return buffer.getvalue()
 
 
 def _load_source_dataframe(uploaded_bytes: bytes) -> pd.DataFrame:
-    bio = io.BytesIO(uploaded_bytes)
-    bio.seek(0)
-    head = bio.read(4)
-    bio.seek(0)
+    buffer = BytesIO(uploaded_bytes)
+    buffer.seek(0)
+    head = buffer.read(4)
+    buffer.seek(0)
     is_xlsx_like = head.startswith(b"PK")
     if is_xlsx_like:
-        return pd.read_excel(bio, engine="openpyxl")
+        return pd.read_excel(buffer, engine="openpyxl")
     return _df_from_xls_bytes(uploaded_bytes)
 
 
@@ -486,41 +518,6 @@ def _maybe_log_debug_samples(df: pd.DataFrame) -> None:
     if os.environ.get("DEBUG_MAPPINGS") == "1":
         records = df.head(3).to_dict(orient="records")
         logging.info("Sample mapped rows: %s", records)
-
-
-def _apply_template_styles(buffer: io.BytesIO, template_path: Path, column_count: int) -> None:
-    buffer.seek(0)
-    wb_out = load_workbook(buffer)
-    ws_out = wb_out.active
-
-    wb_tpl = load_workbook(template_path, read_only=False, data_only=False)
-    ws_tpl = wb_tpl.active
-
-    if ws_tpl.max_column < column_count:
-        logging.warning(
-            "Template has fewer header columns (%s) than output (%s); skipping header styling.",
-            ws_tpl.max_column,
-            column_count,
-        )
-        return
-
-    for col_idx in range(1, column_count + 1):
-        src_cell = ws_tpl.cell(row=1, column=col_idx)
-        dst_cell = ws_out.cell(row=1, column=col_idx)
-        dst_cell.font = src_cell.font
-        dst_cell.fill = src_cell.fill
-        dst_cell.alignment = src_cell.alignment
-        dst_cell.border = src_cell.border
-
-        column_letter = get_column_letter(col_idx)
-        tpl_dim = ws_tpl.column_dimensions.get(column_letter)
-        if tpl_dim is not None and tpl_dim.width is not None:
-            ws_out.column_dimensions[column_letter].width = tpl_dim.width
-
-    ws_out.freeze_panes = "A2"
-
-    wb_out.save(buffer)
-    logging.info("Header styles copied from template.")
 
 
 def _df_from_xls_bytes(xls_bytes: bytes) -> pd.DataFrame:
