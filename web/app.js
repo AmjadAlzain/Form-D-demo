@@ -1,3 +1,4 @@
+// DOM element selections
 const dropzone = document.getElementById("dropzone");
 const fileInput = document.getElementById("file-input");
 const pickBtn = document.getElementById("pick-btn");
@@ -9,9 +10,11 @@ const lastFileSection = document.getElementById("last-file");
 const lastFileLink = document.getElementById("last-file-link");
 const countrySelect = document.getElementById("country-select");
 
+// State variables
 let selectedFile = null;
 let lastDownloadUrl = null;
 
+// File validation constants
 const ACCEPTED_TYPES = [
   "application/vnd.ms-excel",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -19,6 +22,7 @@ const ACCEPTED_TYPES = [
 const ACCEPTED_EXTENSIONS = [".xls", ".xlsx"];
 const MAX_FILE_SIZE = 20 * 1024 * 1024; // 20 MB
 
+// Create and inject a spinner element for loading states.
 const spinner = document.createElement("div");
 spinner.className = "spinner hidden";
 spinner.setAttribute("role", "status");
@@ -27,15 +31,24 @@ spinner.innerHTML =
   '<span class="spinner-icon" aria-hidden="true"></span><span class="spinner-text">Converting…</span>';
 convertForm.insertAdjacentElement("afterend", spinner);
 
+// Spinner visibility functions
 const showSpinner = () => spinner.classList.remove("hidden");
 const hideSpinner = () => spinner.classList.add("hidden");
-let picking = false;
+let picking = false; // Prevents multiple file pick dialogs
 
+/**
+ * Resets the status message.
+ */
 const resetStatus = () => {
   statusEl.textContent = "";
   statusEl.classList.remove("error", "success");
 };
 
+/**
+ * Sets the status message with a specified type (info, error, success).
+ * @param {string} message - The message to display.
+ * @param {string} type - The type of message ('info', 'error', 'success').
+ */
 const setStatus = (message, type = "info") => {
   statusEl.textContent = message;
   statusEl.classList.remove("error", "success");
@@ -47,6 +60,11 @@ const setStatus = (message, type = "info") => {
   }
 };
 
+/**
+ * Formats a file size in bytes into a human-readable string (KB, MB).
+ * @param {number} bytes - The file size in bytes.
+ * @returns {string} The formatted file size.
+ */
 const formatSize = (bytes) => {
   if (!Number.isFinite(bytes)) return "";
   const thresholds = [
@@ -61,6 +79,11 @@ const formatSize = (bytes) => {
   return `${bytes} bytes`;
 };
 
+/**
+ * Checks if a file is a valid Excel file based on its MIME type or extension.
+ * @param {File} file - The file to validate.
+ * @returns {boolean} True if the file is valid, false otherwise.
+ */
 const isValidFile = (file) => {
   if (!file) return false;
   const hasValidType = ACCEPTED_TYPES.includes(file.type);
@@ -70,6 +93,9 @@ const isValidFile = (file) => {
   return hasValidType || hasValidExtension;
 };
 
+/**
+ * Updates the UI to display information about the selected file.
+ */
 const updateFileInfo = () => {
   if (!selectedFile) {
     fileInfo.textContent = "No file selected yet.";
@@ -82,6 +108,10 @@ const updateFileInfo = () => {
   convertButton.disabled = false;
 };
 
+/**
+ * Resets the file selection state and optionally displays an error message.
+ * @param {string} [message] - An optional error message to display.
+ */
 const resetFileSelection = (message) => {
   selectedFile = null;
   fileInput.value = "";
@@ -91,6 +121,10 @@ const resetFileSelection = (message) => {
   }
 };
 
+/**
+ * Handles the selection of files, validates them, and updates the UI.
+ * @param {FileList} files - The list of selected files.
+ */
 const handleFiles = (files) => {
   resetStatus();
   const file = files?.[0];
@@ -115,6 +149,7 @@ const handleFiles = (files) => {
   updateFileInfo();
 };
 
+// Drag and drop event handlers
 const onDragEnter = (event) => {
   event.preventDefault();
   event.stopPropagation();
@@ -145,11 +180,13 @@ const onDrop = (event) => {
   handleFiles(files);
 };
 
+// Attach drag and drop event listeners to the dropzone.
 dropzone.addEventListener("dragenter", onDragEnter);
 dropzone.addEventListener("dragover", onDragOver);
 dropzone.addEventListener("dragleave", onDragLeave);
 dropzone.addEventListener("drop", onDrop);
 
+// Event listener for the "Pick a file" button.
 pickBtn.addEventListener("click", () => {
   if (picking) return;
   picking = true;
@@ -160,12 +197,15 @@ pickBtn.addEventListener("click", () => {
   }, 500);
 });
 
+// Event listener for the file input element.
 fileInput.addEventListener("change", (event) => {
   handleFiles(event.target.files);
 });
 
+// Make the entire dropzone clickable to open the file picker.
 dropzone.addEventListener("click", () => pickBtn.click());
 
+// Event listener for the conversion form submission.
 convertForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   if (!selectedFile) {
@@ -183,16 +223,19 @@ convertForm.addEventListener("submit", async (event) => {
     return;
   }
 
+  // Prepare the form data for the API request.
   const formData = new FormData();
   formData.append("file", selectedFile);
   const country = countrySelect.value || "ID";
 
+  // Update UI to reflect the loading state.
   convertButton.disabled = true;
   convertButton.textContent = "Converting...";
   setStatus("Uploading and converting, please wait...");
   showSpinner();
 
   try {
+    // Make the API call to the conversion endpoint.
     const response = await fetch(`/api/convert?country=${encodeURIComponent(
       country
     )}`, {
@@ -200,6 +243,7 @@ convertForm.addEventListener("submit", async (event) => {
       body: formData,
     });
 
+    // Handle non-successful responses.
     if (!response.ok) {
       let message = "Conversion failed.";
       try {
@@ -217,11 +261,13 @@ convertForm.addEventListener("submit", async (event) => {
       throw new Error(message);
     }
 
+    // Process the successful response.
     const blob = await response.blob();
     const cd = response.headers.get("Content-Disposition") || "";
     const match = /filename="?([^"]+)"?/i.exec(cd);
     const filename = match ? match[1] : "k1-import.xlsx";
 
+    // Create a download link and trigger the download.
     const downloadUrl = URL.createObjectURL(blob);
     if (lastDownloadUrl) {
       URL.revokeObjectURL(lastDownloadUrl);
@@ -233,6 +279,7 @@ convertForm.addEventListener("submit", async (event) => {
     a.click();
     a.remove();
 
+    // Update the "Last File" section with the new download link.
     lastDownloadUrl = downloadUrl;
     lastFileLink.href = downloadUrl;
     lastFileLink.download = filename;
@@ -241,8 +288,10 @@ convertForm.addEventListener("submit", async (event) => {
 
     setStatus("Conversion succeeded. Download should begin shortly.", "success");
   } catch (error) {
+    // Handle errors during the fetch or conversion process.
     setStatus(error.message || "Conversion failed.", "error");
   } finally {
+    // Reset the UI from the loading state.
     convertButton.disabled = !selectedFile;
     convertButton.textContent = "Convert and Download";
     hideSpinner();
