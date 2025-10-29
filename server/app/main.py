@@ -29,7 +29,7 @@ app = FastAPI()
 # For production, 'allow_origins' should be restricted to trusted domains.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # replace with trusted origins for production deployments
+    allow_origins=["*"],  # !!!!! replace with trusted origins for production deployments
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
