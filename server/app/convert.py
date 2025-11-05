@@ -18,6 +18,8 @@ from typing import Iterable, List
 
 import pandas as pd
 from openpyxl import load_workbook
+from xlrd import open_workbook as open_xls_workbook
+from xlutils.copy import copy
 
 TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "K1 Import Template.xls"
 if not TEMPLATE_PATH.exists():
@@ -486,9 +488,25 @@ def convert_to_k1(
 
 def _to_clean_xlsx_bytes(final_df: pd.DataFrame) -> bytes:
     """Convert a DataFrame to XLSX bytes."""
+    template_path = Path(__file__).resolve().parent.parent / "templates" / "K1 Import Template.xls"
+    rb = open_xls_workbook(template_path, formatting_info=True)
+    rs = rb.sheet_by_name('JobCargo')
+    wb = copy(rb)
+    ws = wb.get_sheet('JobCargo')
+
+    # Clear existing data
+    for i in range(1, rs.nrows):
+        for j in range(rs.ncols):
+            ws.write(i, j, None)
+
+    # Write new data
+    for r_idx, row in final_df.iterrows():
+        for c_idx, value in enumerate(row):
+            ws.write(r_idx + 1, c_idx, value)
+
     buffer = BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        final_df.to_excel(writer, sheet_name="Sheet1", index=False)
+    wb.save(buffer)
+    buffer.seek(0)
     return buffer.getvalue()
 
 
